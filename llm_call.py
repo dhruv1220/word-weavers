@@ -1,9 +1,10 @@
 import subprocess
+import shlex
 
 def llm_call(command_temp: str):
-    command = f'ollama run gemma3 "{command_temp}"'
+    # Safely quote the command_temp to avoid shell syntax issues.
+    command = f'ollama run gemma3 {shlex.quote(command_temp)}'
     try:
-        # Run the command using shell=True to mimic your terminal environment
         result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
