@@ -2,6 +2,8 @@ import json
 import datetime
 from llm_call import llm_call
 
+from langgraph.graph import START, END, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
 
 # -------------------------------
 # Core Agent Functions with Expanded Prompts
@@ -63,7 +65,6 @@ def personalized_feedback_agent_llm(metadata: dict, text: str, context: str = ""
 # -------------------------------
 # Dynamic Helper Agents for Writing Metrics
 # Each helper is provided the full detailed criteria for its category.
-# In production, these long prompts would incorporate the complete rubric text.
 # -------------------------------
 
 def content_metrics_agent_llm(text: str, context: str = "") -> dict:
@@ -256,88 +257,145 @@ def modify_text_for_voice(text: str, vp_results: dict) -> str:
     return text + note
 
 # -------------------------------
-# Orchestrator: Iterative Multi-Agent System
+# Build Workflow Graph Using LangGraph StateGraph API
 # -------------------------------
-def multi_agent_system_iterative(ocr_json: dict, voice_threshold: int = 90, max_iterations: int = 5) -> dict:
-    """
-    Orchestrates the multi-agent iterative process:
-      1. Combine OCR JSON (metadata, Title, Story) into full text.
-      2. Iteratively invoke the Grammar & Style Agent and Voice Preservation Agent.
-         If the voice score is below the threshold, modify text and iterate.
-      3. When voice preservation is acceptable (or max iterations reached), call the Personalized Feedback Agent 
-         and evaluate writing metrics using helper agents.
-      4. Aggregate all results into a teacher-friendly report.
-    """
+# We define nodes for grammar, voice, modify, feedback, and metrics.
+# The conditional edge from the voice node checks the voice score to decide if we should loop or continue.
+# This is our final concrete workflow.
+from langgraph.graph import StateGraph  # Using StateGraph from LangGraph
+
+# Define the State schema for our workflow.
+# For simplicity, we use a Python dict; in production you might use a TypedDict.
+State = dict
+
+def grammar_node(state: State) -> State:
+    # Call the grammar agent.
+    state["gs_results"] = grammar_and_style_agent_llm(state["current_text"], state.get("prior_context", ""))
+    return state
+
+def voice_node(state: State) -> State:
+    # Call the voice preservation agent.
+    state["vp_results"] = voice_preservation_agent_llm(state["full_text"], state["gs_results"].get("edited_text", state["current_text"]), state.get("prior_context", ""))
+    return state
+
+def modify_node(state: State) -> State:
+    # Store previous voice score if not already set
+    prev_score = state.get("prev_voice_score", 0)
+    current_score = state.get("vp_results", {}).get("voice_score", 0)
+    
+    # Update current text using a more aggressive modification
+    state["current_text"] = modify_text_for_voice(state["current_text"], state["vp_results"])
+    
+    # Log the iteration
+    if "iteration_logs" not in state:
+        state["iteration_logs"] = []
+    state["iteration_logs"].append({
+        "input_text": state["current_text"],
+        "edited_text": state["gs_results"].get("edited_text", state["current_text"]),
+        "voice_score": current_score,
+        "grammar_changes": state["gs_results"].get("changes", [])
+    })
+    
+    # Check if improvement is minimal
+    improvement = current_score - prev_score
+    state["prev_voice_score"] = current_score  # Update for next iteration
+    # If improvement is less than 5 and we've iterated at least twice, break out by setting a flag.
+    if state.get("iteration_count", 0) >= 2 and improvement < 5:
+        state["force_stop"] = True
+    return state
+
+
+def feedback_node(state: State) -> State:
+    state["pf_results"] = personalized_feedback_agent_llm(state["metadata"], state["full_text"], state.get("prior_context", ""))
+    return state
+
+def metrics_node(state: State) -> State:
+    state["wm_results"] = evaluate_writing_metrics(state["full_text"], state.get("prior_context", ""))
+    return state
+
+# Define condition function for looping.
+def voice_condition(state: State) -> bool:
+    # Exit if voice score is at least 80 OR if force_stop is set.
+    return state.get("vp_results", {}).get("voice_score", 0) >= 90 or state.get("force_stop", False)
+
+# Build the StateGraph.
+graph_builder = StateGraph(State)
+graph_builder.add_node("grammar", grammar_node)
+graph_builder.add_node("voice", voice_node)
+graph_builder.add_node("modify", modify_node)
+graph_builder.add_node("feedback", feedback_node)
+graph_builder.add_node("metrics", metrics_node)
+
+# Define edges:
+graph_builder.add_edge(START, "grammar")
+graph_builder.add_edge("grammar", "voice")
+# Use conditional edges from voice node:
+def route_from_voice(state: State) -> str:
+    return "modify" if voice_condition(state) else "feedback"
+graph_builder.add_conditional_edges("voice", route_from_voice)
+graph_builder.add_edge("modify", "grammar")
+graph_builder.add_edge("feedback", "metrics")
+graph_builder.add_edge("metrics", END)
+
+# Compile the graph with a checkpointer.
+memory = MemorySaver()
+graph = graph_builder.compile(checkpointer=memory)
+
+# -------------------------------
+# Orchestrator: Execute Workflow Using LangGraph's invoke API
+# -------------------------------
+def run_workflow(ocr_json: dict, max_iterations: int = 5, context_dir="context_storage") -> dict:
     metadata = ocr_json.get("metadata", {})
     title = ocr_json.get("Title", "").strip()
     story = ocr_json.get("Story", "").strip()
     full_text = (title + "\n\n" + story).strip()
+    prior_context = ""
     
-    current_text = full_text
-    iteration_logs = []
-    iteration = 0
-    best_gs_results = None
-    best_vp_results = None
-    prior_context = ""  # This can be populated from shared memory or logs in a full system.
+    # Prepare initial state.
+    state = {
+        "metadata": metadata,
+        "full_text": full_text,
+        "current_text": full_text,
+        "prior_context": prior_context
+    }
     
-    while iteration < max_iterations:
-        iteration += 1
-        gs_results = grammar_and_style_agent_llm(current_text, context=prior_context)
-        edited_text = gs_results.get("edited_text", current_text)
-        vp_results = voice_preservation_agent_llm(full_text, edited_text, context=prior_context)
-        voice_score = vp_results.get("voice_score", 0)
-        iteration_logs.append({
-            "iteration": iteration,
-            "input_text": current_text,
-            "edited_text": edited_text,
-            "voice_score": voice_score,
-            "grammar_changes": gs_results.get("changes", [])
-        })
-        if voice_score >= voice_threshold:
-            best_gs_results = gs_results
-            best_vp_results = vp_results
-            break
-        else:
-            current_text = modify_text_for_voice(current_text, vp_results)
-            best_gs_results = gs_results
-            best_vp_results = vp_results
-
-    pf_results = personalized_feedback_agent_llm(metadata, full_text, context=prior_context)
-    wm_results = evaluate_writing_metrics(full_text, context=prior_context)
+    # Provide a config with required keys and increase recursion_limit.
+    config = {
+        "recursion_limit": 25,
+        "configurable": {
+            "thread_id": "1",
+            "checkpoint_ns": "",
+            "checkpoint_id": "1"
+        }
+    }
     
-    def calculate_overall_score(gs, vp, pf):
-        gs["grammar_score"] = int(gs["grammar_score"])
-        gs["style_score"] = int(gs["style_score"])
-        vp["voice_score"] = int(vp["voice_score"])
-        pf["personalized_score"] = int(pf["personalized_score"])
-        return round(gs["grammar_score"] * 0.3 + gs["style_score"] * 0.3 + vp["voice_score"] * 0.2 + pf["personalized_score"] * 0.2, 2)
+    # Invoke the graph with the configuration.
+    final_state = graph.invoke(state, config)
     
-    overall_score = calculate_overall_score(best_gs_results, best_vp_results, pf_results)
+    overall_score = (final_state["gs_results"].get("grammar_score", 0) * 0.3 +
+                     final_state["gs_results"].get("style_score", 0) * 0.3 +
+                     final_state["vp_results"].get("voice_score", 0) * 0.2 +
+                     final_state["pf_results"].get("personalized_score", 0) * 0.2)
+    overall_score = round(overall_score, 2)
     
     report = {
-        "StudentID": {
-            "Name": metadata.get("name", "Unknown"),
-            "School": metadata.get("school", "Unknown"),
-            "DOB": metadata.get("DOB", "Unknown"),
-            "Age": metadata.get("Age", "Unknown")
-        },
+        "StudentID": metadata,
         "Timestamp": datetime.datetime.now().isoformat(),
-        "FinalEditedText": best_vp_results.get("final_text", edited_text),
-        "IterationCount": iteration,
-        "IterationLogs": iteration_logs,
-        "ChangeSuggestions": best_gs_results.get("changes", []),
+        "FinalEditedText": final_state["vp_results"].get("final_text", full_text),
+        "IterationLogs": final_state.get("iteration_logs", []),
+        "ChangeSuggestions": final_state["gs_results"].get("changes", []),
         "Feedback": {
-            "VoicePreservation": best_vp_results.get("voice_feedback", ""),
-            "Personalized": pf_results.get("feedback_message", "")
+            "VoicePreservation": final_state["vp_results"].get("voice_feedback", ""),
+            "Personalized": final_state["pf_results"].get("feedback_message", "")
         },
         "Scores": {
-            "Grammar": best_gs_results.get("grammar_score", 0),
-            "Style": best_gs_results.get("style_score", 0),
-            "VoicePreservation": best_vp_results.get("voice_score", 0),
-            "PersonalizedFeedback": pf_results.get("personalized_score", 0),
+            "Grammar": final_state["gs_results"].get("grammar_score", 0),
+            "Style": final_state["gs_results"].get("style_score", 0),
+            "VoicePreservation": final_state["vp_results"].get("voice_score", 0),
+            "PersonalizedFeedback": final_state["pf_results"].get("personalized_score", 0),
             "Overall": overall_score
         },
-        "WritingMetrics": wm_results
+        "WritingMetrics": final_state.get("wm_results", {})
     }
     return report
 
@@ -359,5 +417,5 @@ if __name__ == "__main__":
         )
     }
     
-    final_report = multi_agent_system_iterative(ocr_json)
+    final_report = run_workflow(ocr_json, max_iterations=5, context_dir="context_storage")
     print(json.dumps(final_report, indent=4))
