@@ -6,6 +6,10 @@ def translate_english_to_spanish(english_text: str):
     command = f"Translate the following text to Spanish without any initial or trailing text: {english_text}"
     return llm_call(command)
 
+def translate_spanish_to_english(spanish_text: str) -> str:
+    command = f"Translate the following text to English without any initial or trailing text: {spanish_text}"
+    return llm_call(command)
+
 if __name__ == "__main__":
     english_text = "Hi! My name is Dhruv."
     output = translate_english_to_spanish(english_text)
